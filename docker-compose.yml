@@ -1,0 +1,187 @@
+version: "3.9"
+
+services:
+  # ============================================================
+  # STREAMING BACKBONE
+  # ============================================================
+  zookeeper:
+    image: confluentinc/cp-zookeeper:7.6.0
+    container_name: flowforge-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    networks:
+      - flowforge-net
+
+  kafka:
+    image: confluentinc/cp-kafka:7.6.0
+    container_name: flowforge-kafka
+    depends_on:
+      - zookeeper
+    ports:
+      - "9092:9092"
+      - "29092:29092"
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://kafka:29092,PLAINTEXT_HOST://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: PLAINTEXT:PLAINTEXT,PLAINTEXT_HOST:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: PLAINTEXT
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "true"
+    networks:
+      - flowforge-net
+
+  # ============================================================
+  # STREAM PROCESSING - Apache Flink
+  # ============================================================
+  flink-jobmanager:
+    image: flink:1.18-java11
+    container_name: flowforge-flink-jobmanager
+    ports:
+      - "8081:8081"
+    command: jobmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        state.backend: filesystem
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+        rest.flamegraph.enabled: true
+    networks:
+      - flowforge-net
+
+  flink-taskmanager:
+    image: flink:1.18-java11
+    container_name: flowforge-flink-taskmanager
+    depends_on:
+      - flink-jobmanager
+    command: taskmanager
+    environment:
+      FLINK_PROPERTIES: |
+        jobmanager.rpc.address: flink-jobmanager
+        taskmanager.numberOfTaskSlots: 4
+        state.backend: filesystem
+        state.checkpoints.dir: file:///tmp/flink-checkpoints
+    networks:
+      - flowforge-net
+
+  # ============================================================
+  # LAKEHOUSE - Apache Iceberg + MinIO
+  # ============================================================
+  minio:
+    image: minio/minio:latest
+    container_name: flowforge-minio
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: admin
+      MINIO_ROOT_PASSWORD: password123
+    command: server /data --console-address ":9001"
+    volumes:
+      - minio-data:/data
+    networks:
+      - flowforge-net
+
+  minio-init:
+    image: minio/mc:latest
+    container_name: flowforge-minio-init
+    depends_on:
+      - minio
+    entrypoint: >
+      /bin/sh -c " sleep 5; mc alias set local http://minio:9000 admin password123; mc mb local/lakehouse --ignore-existing; mc mb local/checkpoints --ignore-existing; echo 'MinIO buckets created'; "
+    networks:
+      - flowforge-net
+
+  iceberg-rest:
+    image: tabulario/iceberg-rest:latest
+    container_name: flowforge-iceberg-rest
+    ports:
+      - "8181:8181"
+    environment:
+      AWS_ACCESS_KEY_ID: admin
+      AWS_SECRET_ACCESS_KEY: password123
+      AWS_REGION: us-east-1
+      CATALOG_WAREHOUSE: s3://lakehouse/
+      CATALOG_IO__IMPL: org.apache.iceberg.aws.s3.S3FileIO
+      CATALOG_S3_ENDPOINT: http://minio:9000
+      CATALOG_S3_PATH__STYLE__ACCESS: "true"
+    depends_on:
+      - minio
+    networks:
+      - flowforge-net
+
+  # ============================================================
+  # DATABASES
+  # ============================================================
+  postgres:
+    image: postgres:16
+    container_name: flowforge-postgres
+    ports:
+      - "5432:5432"
+    environment:
+      POSTGRES_USER: flowforge
+      POSTGRES_PASSWORD: flowforge123
+      POSTGRES_DB: ecommerce
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./data/init/postgres:/docker-entrypoint-initdb.d
+    command: >
+      postgres
+        -c wal_level=logical
+        -c max_replication_slots=4
+        -c max_wal_senders=4
+    networks:
+      - flowforge-net
+
+  mongodb:
+    image: mongo:7
+    container_name: flowforge-mongodb
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: flowforge
+      MONGO_INITDB_ROOT_PASSWORD: flowforge123
+      MONGO_INITDB_DATABASE: ecommerce
+    volumes:
+      - mongodb-data:/data/db
+      - ./data/init/mongodb:/docker-entrypoint-initdb.d
+    command: [ "--replSet", "rs0" ]
+    networks:
+      - flowforge-net
+
+  mongodb-init:
+    image: mongo:7
+    container_name: flowforge-mongodb-init
+    depends_on:
+      - mongodb
+    entrypoint: >
+      /bin/sh -c " sleep 5; mongosh --host mongodb -u flowforge -p flowforge123 --authenticationDatabase admin --eval 'rs.initiate({_id: \"rs0\", members: [{_id: 0, host: \"mongodb:27017\"}]})' || true; echo 'MongoDB replica set initiated'; "
+    networks:
+      - flowforge-net
+
+  redis:
+    image: redis:7-alpine
+    container_name: flowforge-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis-data:/data
+    networks:
+      - flowforge-net
+
+volumes:
+  minio-data:
+  postgres-data:
+  mongodb-data:
+  redis-data:
+
+
+networks:
+  flowforge-net:
+    driver: bridge
+    name: flowforge-net
