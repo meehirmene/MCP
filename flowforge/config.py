@@ -9,13 +9,14 @@ class KafkaConfig(BaseSettings):
     bootstrap_servers: str = "localhost:9092"
     internal_bootstrap_servers: str = "kafka:29092"
 
-    model_config = {"env_prefix": "KAFKA_"}
+    model_config = {"env_prefix": "KAFKA_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 class FlinkConfig(BaseSettings):
     jobmanager_url: str = "http://localhost:8081"
+    sql_gateway_url: str = "http://localhost:8083"
 
-    model_config = {"env_prefix": "FLINK_"}
+    model_config = {"env_prefix": "FLINK_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 class IcebergConfig(BaseSettings):
@@ -25,7 +26,7 @@ class IcebergConfig(BaseSettings):
     s3_access_key: str = "admin"
     s3_secret_key: str = "password123"
 
-    model_config = {"env_prefix": "ICEBERG_"}
+    model_config = {"env_prefix": "ICEBERG_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 class PostgresConfig(BaseSettings):
@@ -35,7 +36,7 @@ class PostgresConfig(BaseSettings):
     user: str = "flowforge"
     password: str = "flowforge123"
 
-    model_config = {"env_prefix": "POSTGRES_"}
+    model_config = {"env_prefix": "POSTGRES_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @property
     def dsn(self) -> str:
@@ -49,7 +50,7 @@ class MongoConfig(BaseSettings):
     user: str = "flowforge"
     password: str = "flowforge123"
 
-    model_config = {"env_prefix": "MONGO_"}
+    model_config = {"env_prefix": "MONGO_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @property
     def uri(self) -> str:
@@ -61,17 +62,17 @@ class RedisConfig(BaseSettings):
     port: int = 6379
     db: int = 0
 
-    model_config = {"env_prefix": "REDIS_"}
+    model_config = {"env_prefix": "REDIS_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 class LLMConfig(BaseSettings):
-    provider: str = "openai"  # openai | gemini | anthropic | ollama
+    provider: str = "openai"  # openai | gemini | anthropic | ollama | local_mlx
     model: str = "gpt-4o"
     api_key: Optional[str] = None
     base_url: Optional[str] = None
     temperature: float = 0.1
 
-    model_config = {"env_prefix": "LLM_"}
+    model_config = {"env_prefix": "LLM_", "env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
 
 class FlowForgeConfig(BaseSettings):

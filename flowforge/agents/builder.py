@@ -14,6 +14,7 @@ import logging
 from flowforge.agents.shared.base import (
     BaseAgent, AgentRole, AgentTask, AgentCapability, TaskStatus,
 )
+from flowforge.config import config
 from flowforge.servers.postgres_mcp import list_tables, inspect_schema, check_cdc_status, query
 from flowforge.servers.kafka_mcp import list_topics, create_topic, produce_message, produce_batch
 from flowforge.servers.flink_mcp import cluster_overview, list_jobs, submit_sql
@@ -98,7 +99,10 @@ class BuilderAgent(BaseAgent):
                 result = await self._setup_cdc_pipeline(task)
             elif "topic" in description_lower or "kafka" in description_lower:
                 result = await self._create_kafka_topic(task)
-            elif "flink" in description_lower or "aggregat" in description_lower or "stream" in description_lower:
+            elif ("flink" in description_lower or "aggregat" in description_lower or "stream" in description_lower
+                  or "hourly" in description_lower or "daily" in description_lower or "weekly" in description_lower
+                  or "revenue" in description_lower or "calculat" in description_lower or "window" in description_lower
+                  or "tumble" in description_lower or "total" in description_lower):
                 result = await self._create_flink_job(task)
             elif "pipeline" in description_lower:
                 result = await self._build_full_pipeline(task)
@@ -187,40 +191,218 @@ class BuilderAgent(BaseAgent):
         )
         return json.loads(result)
 
-    async def _create_flink_job(self, task: AgentTask) -> dict:
-        """Generate and submit a Flink SQL job."""
-        # Use LLM to generate Flink SQL based on the task description
-        context = task.context.copy()
+    # ─────────────────────────────────────────────
+    # Flink SQL Template Helpers
+    # ─────────────────────────────────────────────
 
-        # Get source schema if not already provided
+    def _pg_to_flink_type(self, pg_type: str) -> str:
+        """Map a PostgreSQL column type to its Flink SQL equivalent."""
+        mapping = {
+            "integer": "INT",
+            "bigint": "BIGINT",
+            "smallint": "SMALLINT",
+            "character varying": "STRING",
+            "varchar": "STRING",
+            "text": "STRING",
+            "numeric": "DECIMAL(10,2)",
+            "decimal": "DECIMAL(10,2)",
+            "double precision": "DOUBLE",
+            "real": "FLOAT",
+            "boolean": "BOOLEAN",
+            "timestamp without time zone": "TIMESTAMP(3)",
+            "timestamp with time zone": "TIMESTAMP_LTZ(3)",
+            "date": "DATE",
+            "json": "STRING",
+            "jsonb": "STRING",
+        }
+        return mapping.get(pg_type.lower().strip(), "STRING")
+
+    def _build_cdc_source_sql(self, table_name: str, columns: list[dict]) -> str:
+        """Generate a Flink PostgreSQL CDC source table definition."""
+        col_defs = []
+        pk_col = None
+        for col in columns:
+            name = col["column_name"]
+            flink_type = self._pg_to_flink_type(col.get("data_type", "text"))
+            col_defs.append(f"    {name} {flink_type}")
+            if name in ("id", f"{table_name}_id", "order_id"):
+                pk_col = name
+        col_defs.append("    proc_time AS PROCTIME()")
+        pk_clause = f",\n    PRIMARY KEY ({pk_col}) NOT ENFORCED" if pk_col else ""
+        cols_sql = ",\n".join(col_defs)
+        pg = config.postgres
+        return (
+            f"CREATE TABLE IF NOT EXISTS {table_name}_cdc (\n"
+            f"{cols_sql}{pk_clause}\n"
+            f") WITH (\n"
+            f"    'connector' = 'postgres-cdc',\n"
+            f"    'hostname' = '{pg.host}',\n"
+            f"    'port' = '{pg.port}',\n"
+            f"    'username' = '{pg.user}',\n"
+            f"    'password' = '{pg.password}',\n"
+            f"    'database-name' = '{pg.database}',\n"
+            f"    'schema-name' = 'public',\n"
+            f"    'table-name' = '{table_name}'\n"
+            f")"
+        )
+
+    def _build_iceberg_sink_sql(self, table_name: str, columns: list[dict]) -> str:
+        """Generate a Flink Iceberg REST catalog sink table definition."""
+        col_defs = [f"    {col['column_name']} {self._pg_to_flink_type(col.get('data_type', 'text'))}"
+                    for col in columns]
+        cols_sql = ",\n".join(col_defs)
+        ic = config.iceberg
+        return (
+            f"CREATE TABLE IF NOT EXISTS iceberg_{table_name} (\n"
+            f"{cols_sql}\n"
+            f") WITH (\n"
+            f"    'connector' = 'iceberg',\n"
+            f"    'catalog-name' = 'iceberg_catalog',\n"
+            f"    'catalog-type' = 'rest',\n"
+            f"    'uri' = '{ic.rest_url}',\n"
+            f"    'warehouse' = '{ic.warehouse}',\n"
+            f"    's3.endpoint' = '{ic.s3_endpoint}',\n"
+            f"    's3.access-key' = '{ic.s3_access_key}',\n"
+            f"    's3.secret-key' = '{ic.s3_secret_key}'\n"
+            f")"
+        )
+
+    def _build_window_aggregation_sql(
+        self,
+        source_table: str,
+        sink_table: str,
+        group_by: str,
+        window_seconds: int = 300,
+    ) -> str:
+        """Generate a Flink TUMBLE window aggregation INSERT statement."""
+        return (
+            f"INSERT INTO {sink_table}\n"
+            f"SELECT\n"
+            f"    {group_by},\n"
+            f"    COUNT(*) AS event_count,\n"
+            f"    SUM(CAST(total_amount AS DOUBLE)) AS total_revenue,\n"
+            f"    TUMBLE_START(proc_time, INTERVAL '{window_seconds}' SECOND) AS window_start,\n"
+            f"    TUMBLE_END(proc_time, INTERVAL '{window_seconds}' SECOND) AS window_end\n"
+            f"FROM {source_table}\n"
+            f"GROUP BY {group_by}, TUMBLE(proc_time, INTERVAL '{window_seconds}' SECOND)"
+        )
+
+    # ─────────────────────────────────────────────
+    # Flink Job Creation
+    # ─────────────────────────────────────────────
+
+    async def _create_flink_job(self, task: AgentTask) -> dict:
+        """Generate Flink SQL using templates and submit it to the cluster."""
+        context = task.context.copy()
+        table_name = context.get("source_table", "orders")
+
+        # Get source schema
         if "source_schema" not in context:
-            table_name = context.get("source_table", "orders")
             schema_json = await self.call_tool("pg_inspect_schema", table_name=table_name)
             context["source_schema"] = json.loads(schema_json)
 
-        # Generate Flink SQL using LLM
-        prompt = f"""Generate Flink SQL statements for the following pipeline task:
+        schema = context["source_schema"]
+        columns = schema.get("columns", [])
+        description_lower = task.description.lower()
 
-Task: {task.description}
+        # Build SQL from templates
+        cdc_sql = self._build_cdc_source_sql(table_name, columns)
+        iceberg_sql = self._build_iceberg_sink_sql(table_name, columns)
 
-Source Schema:
-{json.dumps(context.get('source_schema', {}), indent=2)}
+        submitted_jobs = []
 
-Requirements:
-1. Create a Kafka source table that reads CDC events
-2. Create an Iceberg sink table
-3. If aggregation is needed, create the appropriate windowed query
-4. Use the correct Flink SQL syntax for streaming
+        # Submit CDC source table definition
+        cdc_result = json.loads(await self.call_tool("flink_submit_sql", sql_statement=cdc_sql))
+        if cdc_result.get("error"):
+            raise RuntimeError(f"Flink SQL (CDC source) failed: {cdc_result['error']}")
+        submitted_jobs.append({"type": "cdc_source", "result": cdc_result})
 
-Return ONLY the SQL statements, separated by semicolons. No explanations."""
+        # Submit Iceberg sink table definition
+        iceberg_result = json.loads(await self.call_tool("flink_submit_sql", sql_statement=iceberg_sql))
+        if iceberg_result.get("error"):
+            raise RuntimeError(f"Flink SQL (Iceberg sink) failed: {iceberg_result['error']}")
+        submitted_jobs.append({"type": "iceberg_sink", "result": iceberg_result})
 
-        flink_sql = await self.reason(prompt, context)
+        # Determine if windowed aggregation is needed
+        group_by = context.get("group_by", "region")
+        if "hourly" in description_lower or ("hour" in description_lower and "hourly" not in description_lower):
+            window_seconds = int(context.get("window_seconds", 3600))
+        elif "daily" in description_lower or "day" in description_lower:
+            window_seconds = int(context.get("window_seconds", 86400))
+        else:
+            window_seconds = int(context.get("window_seconds", 300))
+        needs_agg = any(kw in description_lower for kw in (
+            "aggregat", "window", "region", "tumble", "minute",
+            "hourly", "daily", "weekly", "revenue", "calculat", "total", "sum", "count", "average", "avg",
+        ))
 
+        if needs_agg:
+            agg_cols = [
+                {"column_name": group_by, "data_type": "character varying"},
+                {"column_name": "event_count", "data_type": "bigint"},
+                {"column_name": "total_revenue", "data_type": "double precision"},
+                {"column_name": "window_start", "data_type": "timestamp without time zone"},
+                {"column_name": "window_end", "data_type": "timestamp without time zone"},
+            ]
+            agg_sink_sql = self._build_iceberg_sink_sql(f"{table_name}_agg", agg_cols)
+            await self.call_tool("flink_submit_sql", sql_statement=agg_sink_sql)
+            insert_sql = self._build_window_aggregation_sql(
+                f"{table_name}_cdc", f"iceberg_{table_name}_agg", group_by, window_seconds,
+            )
+        else:
+            col_names = ", ".join(col["column_name"] for col in columns)
+            insert_sql = f"INSERT INTO iceberg_{table_name} SELECT {col_names} FROM {table_name}_cdc"
+
+        # Submit the streaming INSERT — this creates the actual Flink job
+        insert_result = json.loads(await self.call_tool("flink_submit_sql", sql_statement=insert_sql))
+        if insert_result.get("error"):
+            raise RuntimeError(f"Flink SQL (streaming insert) failed: {insert_result['error']}")
+        submitted_jobs.append({"type": "streaming_insert", "result": insert_result})
+
+        session_id = insert_result.get("session_id", "")
+        operation_handle = insert_result.get("operation_handle", "")
+        job_ref = operation_handle or session_id
+
+        # Persist pipeline state for Healer to reference on restart
+        pipeline_id = context.get("pipeline_id", f"pipeline-{table_name}")
+        self.memory.set_pipeline_state(pipeline_id, {
+            "status": "running",
+            "source_table": table_name,
+            "flink_session_id": session_id,
+            "flink_operation_handle": operation_handle,
+            "flink_job_ref": job_ref,
+            "cdc_sql": cdc_sql,
+            "iceberg_sql": iceberg_sql,
+            "insert_sql": insert_sql,
+            "source": f"PostgreSQL → CDC → Flink → Iceberg",
+        })
+
+        self.memory.log_event({
+            "agent_id": self.agent_id,
+            "agent_role": self.role.value,
+            "event_type": "FLINK_JOB_SUBMITTED",
+            "pipeline_id": pipeline_id,
+            "details": {
+                "table": table_name,
+                "job_ref": job_ref,
+                "task": task.description,
+                "aggregation": needs_agg,
+            },
+        })
+
+        logger.info(f"[{self.agent_id}] Flink job submitted: pipeline={pipeline_id}, ref={job_ref}")
         return {
-            "status": "flink_sql_generated",
-            "task": task.description,
-            "generated_sql": flink_sql,
-            "source_schema": context.get("source_schema"),
+            "status": "flink_job_submitted",
+            "pipeline_id": pipeline_id,
+            "table": table_name,
+            "job_ref": job_ref,
+            "aggregation_enabled": needs_agg,
+            "submitted_jobs": submitted_jobs,
+            "sql_statements": {
+                "cdc_source": cdc_sql,
+                "iceberg_sink": iceberg_sql,
+                "streaming_insert": insert_sql,
+            },
         }
 
     async def _build_full_pipeline(self, task: AgentTask) -> dict:

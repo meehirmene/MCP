@@ -1,7 +1,7 @@
 """
 FlowForge LLM Client — Configurable LLM provider abstraction.
 
-Supports OpenAI, Google Gemini, Anthropic Claude, and local Ollama.
+Supports OpenAI, Google Gemini, Anthropic Claude, local Ollama, and local MLX (Apple Silicon).
 """
 
 import json
@@ -43,6 +43,12 @@ class LLMClient:
                 base_url=config.llm.base_url or "http://localhost:11434/v1",
                 api_key="ollama",
             )
+        elif self.provider == "local_mlx":
+            from openai import OpenAI
+            self._client = OpenAI(
+                base_url=config.llm.base_url or "http://localhost:8080/v1",
+                api_key="local",
+            )
         else:
             raise ValueError(f"Unknown LLM provider: {self.provider}")
 
@@ -66,7 +72,7 @@ class LLMClient:
         """
         client = self._get_client()
 
-        if self.provider in ("openai", "ollama"):
+        if self.provider in ("openai", "ollama", "local_mlx"):
             return self._chat_openai(client, messages, tools, tool_choice)
         elif self.provider == "gemini":
             return self._chat_gemini(client, messages)

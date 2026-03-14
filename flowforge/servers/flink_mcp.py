@@ -23,6 +23,10 @@ def _flink_url(path: str) -> str:
     return f"{config.flink.jobmanager_url}{path}"
 
 
+def _sql_gateway_url(path: str) -> str:
+    return f"{config.flink.sql_gateway_url}{path}"
+
+
 async def _flink_get(path: str) -> dict:
     async with httpx.AsyncClient(timeout=30) as client:
         resp = await client.get(_flink_url(path))
@@ -153,21 +157,24 @@ async def submit_sql(sql_statement: str) -> str:
         sql_statement: The Flink SQL statement to execute
     """
     try:
-        # Use Flink SQL Gateway REST API
-        # Create session
-        session_resp = await _flink_post("/v1/sessions", {
-            "properties": {
-                "execution.runtime-mode": "streaming",
-            }
-        })
-        session_id = session_resp.get("sessionHandle")
+        # Use Flink SQL Gateway REST API (separate service on port 8083)
+        async with httpx.AsyncClient(timeout=30) as client:
+            # Create session
+            session_resp = await client.post(
+                _sql_gateway_url("/v1/sessions"),
+                json={"properties": {"execution.runtime-mode": "streaming"}},
+            )
+            session_resp.raise_for_status()
+            session_id = session_resp.json().get("sessionHandle")
 
-        # Execute statement
-        exec_resp = await _flink_post(
-            f"/v1/sessions/{session_id}/statements",
-            {"statement": sql_statement}
-        )
-        operation_handle = exec_resp.get("operationHandle")
+            # Execute statement
+            exec_resp = await client.post(
+                _sql_gateway_url(f"/v1/sessions/{session_id}/statements"),
+                json={"statement": sql_statement},
+            )
+            exec_resp.raise_for_status()
+            exec_data = exec_resp.json()
+        operation_handle = exec_data.get("operationHandle")
 
         return json.dumps({
             "status": "submitted",
@@ -184,7 +191,39 @@ async def submit_sql(sql_statement: str) -> str:
             "sql": sql_statement,
         })
     except Exception as e:
-        return json.dumps({"error": str(e), "sql": sql_statement})
+        err = str(e)
+        if "Connection refused" in err or "connect" in err.lower() or "ConnectError" in err:
+            return json.dumps({
+                "error": "Flink SQL Gateway unreachable at port 8083. Check: docker compose ps flink-sql-gateway",
+                "sql": sql_statement,
+            })
+        return json.dumps({"error": err, "sql": sql_statement})
+
+
+@flink_mcp.tool()
+async def create_savepoint(job_id: str, target_directory: str = "/tmp/flink-savepoints") -> str:
+    """Trigger a savepoint for a running Flink job and return the savepoint path.
+
+    Args:
+        job_id: The Flink job ID to savepoint
+        target_directory: Directory where the savepoint should be stored
+    """
+    try:
+        result = await _flink_post(f"/jobs/{job_id}/savepoints", {
+            "target-directory": target_directory,
+            "cancel-job": False,
+        })
+        request_id = result.get("request-id", "")
+        # Construct the expected savepoint path (async on Flink side, best-effort)
+        savepoint_path = f"{target_directory}/{job_id}"
+        return json.dumps({
+            "status": "savepoint_triggered",
+            "job_id": job_id,
+            "request_id": request_id,
+            "savepoint_path": savepoint_path,
+        }, indent=2)
+    except Exception as e:
+        return json.dumps({"error": str(e), "job_id": job_id, "savepoint_path": None})
 
 
 @flink_mcp.tool()

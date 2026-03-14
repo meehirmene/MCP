@@ -186,3 +186,189 @@ class AgentMemory:
         if keys:
             self._redis.delete(*keys)
         logger.warning("All FlowForge memory cleared!")
+
+    # ─────────────────────────────────────────────
+    # Incident Memory & Pattern Learning
+    # ─────────────────────────────────────────────
+
+    def store_incident(self, incident_type: str, context: dict, resolution: dict, success: bool) -> str:
+        """Store an incident and its resolution outcome for agent learning.
+
+        Returns the resolution_key (hash) for future reference.
+        """
+        import hashlib
+        resolution_key = hashlib.md5(json.dumps(resolution, sort_keys=True).encode()).hexdigest()[:8]
+
+        incident = {
+            "incident_type": incident_type,
+            "context": context,
+            "resolution": resolution,
+            "resolution_key": resolution_key,
+            "success": success,
+            "occurred_at": datetime.now(timezone.utc).isoformat(),
+        }
+
+        # Store incident log — capped at 50 per type
+        list_key = self._key("incidents", incident_type)
+        self._redis.lpush(list_key, json.dumps(incident))
+        self._redis.ltrim(list_key, 0, 49)
+
+        # Update or create the pattern record
+        pattern_key = self._key("patterns", incident_type, resolution_key)
+        now = datetime.now(timezone.utc).isoformat()
+
+        if self._redis.exists(pattern_key):
+            if success:
+                self._redis.hincrby(pattern_key, "success_count", 1)
+            else:
+                self._redis.hincrby(pattern_key, "failure_count", 1)
+            self._redis.hset(pattern_key, "last_used", now)
+        else:
+            self._redis.hset(pattern_key, mapping={
+                "incident_type": incident_type,
+                "resolution": json.dumps(resolution),
+                "resolution_key": resolution_key,
+                "success_count": str(1 if success else 0),
+                "failure_count": str(0 if success else 1),
+                "last_used": now,
+                "created_at": now,
+            })
+
+        # Update global learnings sorted set (score = success_count)
+        success_count = int(self._redis.hget(pattern_key, "success_count") or 0)
+        self._redis.zadd(
+            self._key("agent_learnings"),
+            {f"{incident_type}:{resolution_key}": success_count},
+        )
+
+        logger.info(f"Incident stored: {incident_type} (success={success}, key={resolution_key})")
+        return resolution_key
+
+    def get_best_resolution(self, incident_type: str, min_success_count: int = 3) -> dict | None:
+        """Get the highest-confidence resolution for a given incident type.
+
+        Returns None if no pattern meets the minimum success threshold.
+        """
+        pattern_keys = self._redis.keys(self._key("patterns", incident_type, "*"))
+        best: dict | None = None
+        best_score = -1.0
+
+        for key in pattern_keys:
+            data = self._redis.hgetall(key)
+            if not data:
+                continue
+            success_count = int(data.get("success_count", 0))
+            failure_count = int(data.get("failure_count", 0))
+            if success_count < min_success_count:
+                continue
+            total = success_count + failure_count
+            rate = success_count / total if total > 0 else 0.0
+            score = success_count * rate  # weight by both volume and success rate
+            if score > best_score:
+                best_score = score
+                try:
+                    resolution = json.loads(data.get("resolution", "{}"))
+                except json.JSONDecodeError:
+                    resolution = {}
+                best = {
+                    "incident_type": data.get("incident_type", incident_type),
+                    "resolution": resolution,
+                    "resolution_key": data.get("resolution_key", ""),
+                    "success_count": success_count,
+                    "failure_count": failure_count,
+                    "success_rate": round(rate, 2),
+                    "last_used": data.get("last_used", ""),
+                }
+
+        return best
+
+    def increment_resolution_success(self, incident_type: str, resolution_key: str) -> None:
+        """Record an additional successful use of a known resolution pattern."""
+        pattern_key = self._key("patterns", incident_type, resolution_key)
+        if self._redis.exists(pattern_key):
+            self._redis.hincrby(pattern_key, "success_count", 1)
+            self._redis.hset(pattern_key, "last_used", datetime.now(timezone.utc).isoformat())
+            success_count = int(self._redis.hget(pattern_key, "success_count") or 0)
+            self._redis.zadd(
+                self._key("agent_learnings"),
+                {f"{incident_type}:{resolution_key}": success_count},
+            )
+
+    # ─────────────────────────────────────────────
+    # Scheduled Pipelines
+    # ─────────────────────────────────────────────
+
+    def set_schedule(self, schedule_id: str, schedule: dict) -> None:
+        """Store a scheduled pipeline entry."""
+        schedule = {**schedule, "updated_at": datetime.now(timezone.utc).isoformat()}
+        self._redis.hset(
+            self._key("schedules", schedule_id),
+            mapping={
+                k: json.dumps(v) if isinstance(v, (dict, list)) else str(v)
+                for k, v in schedule.items()
+            },
+        )
+        self._redis.sadd(self._key("schedule_ids"), schedule_id)
+
+    def get_schedules(self) -> list[dict]:
+        """Return all stored schedules."""
+        ids = self._redis.smembers(self._key("schedule_ids"))
+        result = []
+        for sid in ids:
+            data = self._redis.hgetall(self._key("schedules", sid))
+            if data:
+                parsed: dict = {"schedule_id": sid}
+                for k, v in data.items():
+                    try:
+                        parsed[k] = json.loads(v)
+                    except (json.JSONDecodeError, TypeError):
+                        parsed[k] = v
+                result.append(parsed)
+        return result
+
+    def delete_schedule(self, schedule_id: str) -> bool:
+        """Delete a schedule. Returns True if it existed."""
+        existed = self._redis.exists(self._key("schedules", schedule_id))
+        self._redis.delete(self._key("schedules", schedule_id))
+        self._redis.srem(self._key("schedule_ids"), schedule_id)
+        return bool(existed)
+
+    def get_all_learnings(self) -> list[dict]:
+        """Return all stored incident patterns sorted by success count descending."""
+        entries = self._redis.zrevrangebyscore(
+            self._key("agent_learnings"), "+inf", "-inf", withscores=True, start=0, num=100,
+        )
+        learnings = []
+        for member, score in entries:
+            parts = member.split(":", 1)
+            if len(parts) != 2:
+                continue
+            incident_type, resolution_key = parts
+            pattern_key = self._key("patterns", incident_type, resolution_key)
+            data = self._redis.hgetall(pattern_key)
+            if not data:
+                continue
+            try:
+                resolution = json.loads(data.get("resolution", "{}"))
+            except json.JSONDecodeError:
+                resolution = {}
+            success_count = int(data.get("success_count", 0))
+            failure_count = int(data.get("failure_count", 0))
+            total = success_count + failure_count
+            # Build a human-readable summary of the resolution
+            summary_parts = []
+            for k, v in resolution.items():
+                if isinstance(v, str) and len(v) < 80:
+                    summary_parts.append(f"{k}: {v}")
+            resolution_summary = "; ".join(summary_parts[:3]) or str(resolution)[:80]
+            learnings.append({
+                "incident_type": data.get("incident_type", incident_type),
+                "resolution_summary": resolution_summary,
+                "resolution": resolution,
+                "success_count": success_count,
+                "failure_count": failure_count,
+                "success_rate": round(success_count / total, 2) if total > 0 else 0.0,
+                "last_used": data.get("last_used", ""),
+                "created_at": data.get("created_at", ""),
+            })
+        return learnings
